@@ -1,0 +1,38 @@
+{
+  "step_measured": 3100,
+  "reruns_per_variant": 4,
+  "items": [
+    {
+      "name": "no Polar Express",
+      "delta_val_loss": 0.00213
+    },
+    {
+      "name": "no eta floor",
+      "delta_val_loss": 0.00313
+    },
+    {
+      "name": "no Contra-Muon",
+      "delta_val_loss": 0.00357
+    },
+    {
+      "name": "no embed init",
+      "delta_val_loss": 0.00369
+    },
+    {
+      "name": "cf = 1.0 (no cooldown)",
+      "delta_val_loss": 0.00495
+    },
+    {
+      "name": "no MuonEq",
+      "delta_val_loss": 0.00591
+    },
+    {
+      "name": "no attention LR mult",
+      "delta_val_loss": 0.00706
+    },
+    {
+      "name": "no mu schedule",
+      "delta_val_loss": 0.00791
+    }
+  ]
+}
