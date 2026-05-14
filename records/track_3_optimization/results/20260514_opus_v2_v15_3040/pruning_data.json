@@ -1,0 +1,50 @@
+{
+  "step_measured": 3035,
+  "reruns_per_variant": 4,
+  "items": [
+    {
+      "name": "no CGI",
+      "delta_val_loss": -4e-05
+    },
+    {
+      "name": "no embed init",
+      "delta_val_loss": -1e-05
+    },
+    {
+      "name": "no DI-fc init",
+      "delta_val_loss": 4e-05
+    },
+    {
+      "name": "no Contra-Muon",
+      "delta_val_loss": 0.00049
+    },
+    {
+      "name": "no eta_min floor",
+      "delta_val_loss": 0.00076
+    },
+    {
+      "name": "no Adam beta2 = 0.99",
+      "delta_val_loss": 0.00081
+    },
+    {
+      "name": "no Polar Express",
+      "delta_val_loss": 0.00125
+    },
+    {
+      "name": "cf = 1.0 (no cooldown)",
+      "delta_val_loss": 0.003
+    },
+    {
+      "name": "no mu schedule",
+      "delta_val_loss": 0.00355
+    },
+    {
+      "name": "no attention LR mult",
+      "delta_val_loss": 0.00358
+    },
+    {
+      "name": "no MuonEq",
+      "delta_val_loss": 0.00427
+    }
+  ]
+}
