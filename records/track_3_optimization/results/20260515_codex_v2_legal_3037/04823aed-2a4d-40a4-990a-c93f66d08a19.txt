@@ -1,0 +1,536 @@
+Using seed=5
+"""
+train_gpt_simple.py
+
+This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
+It was prepared as a simplified version of the speedrun for use in neural net optimization research.
+"""
+
+import os
+import sys
+import argparse
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import uuid
+import time
+from pathlib import Path
+
+import torch
+from torch import Tensor, nn
+from torch.optim import AdamW
+import torch.nn.functional as F
+import torch.distributed as dist
+
+
+########################################
+#              Dataloader              #
+########################################
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2]) # number of tokens (claimed)
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
+    files = sorted(Path.cwd().glob(filename_pattern))
+    assert batch_size % dist.get_world_size() == 0
+    local_batch_size = batch_size // dist.get_world_size()
+    file_iter = iter(files)
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    while True:
+        if pos + batch_size + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+        buf = tokens[pos + dist.get_rank() * local_batch_size:][:local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        pos += batch_size
+        yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
+
+
+########################################
+#             Architecture             #
+########################################
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gains = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return F.rms_norm(x, (x.size(-1),), weight=self.gains.type_as(x))
+
+class Linear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=True)
+
+    def forward(self, x):
+        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        # half-truncate RoPE (w/ base freq tuning)
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        self.register_buffer("angular_freq", torch.cat([angular_freq, angular_freq.new_zeros(dim//4)]))
+
+    def forward(self, x_BTHD: Tensor):
+        pos = torch.arange(x_BTHD.size(1), dtype=torch.float32, device=x_BTHD.device)
+        theta = torch.outer(pos, self.angular_freq)[None, :, None, :]
+        cos, sin = theta.cos(), theta.sin()
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, head_dim=128):
+        super().__init__()
+        self.num_heads = dim // head_dim
+        self.head_dim = head_dim
+        hdim = self.num_heads * self.head_dim
+        self.q = Linear(dim, hdim)
+        self.k = Linear(dim, hdim)
+        self.v = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+        self.rotary = Rotary(head_dim)
+
+    def forward(self, x: Tensor):
+        B, T = x.size(0), x.size(1)
+        q = self.q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.v(x).view(B, T, self.num_heads, self.head_dim)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
+        q, k = self.rotary(q), self.rotary(k)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
+                                           v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+        y = self.proj(y)
+        return y
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.fc = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+
+    def forward(self, x: Tensor):
+        x = self.fc(x)
+        x = x.relu().square()
+        x = self.proj(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.attn = CausalSelfAttention(dim)
+        self.mlp = MLP(dim)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+
+    def forward(self, x: Tensor):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
+        self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
+        self.proj = Linear(model_dim, vocab_size)
+        self.norm1 = RMSNorm(model_dim)
+        self.norm2 = RMSNorm(model_dim)
+
+    def forward(self, inputs: Tensor, targets: Tensor):
+        x = self.norm1(self.embed(inputs))
+        for block in self.blocks:
+            x = block(x)
+        logits = self.proj(self.norm2(x)).float()
+        logits = 15 * logits * (logits.square() + 15**2).rsqrt()
+        return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
+
+
+########################################
+#              Optimizer               #
+########################################
+
+_POLAR_EXPRESS_COEFFS = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+]
+
+def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
+    assert G.ndim >= 2
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
+    for a, b, c in _POLAR_EXPRESS_COEFFS:
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+_CONTRA_MUON = 0.225
+
+@torch.compile
+def muon_update(grad, momentum, mu=0.95, nesterov=True):
+    momentum.lerp_(grad, 1 - mu)
+    update = grad.lerp_(momentum, mu) if nesterov else momentum
+    row_norms = (update * update).sum(dim=-1, keepdim=True).sqrt() + 1e-8
+    update = update / row_norms
+    pre_ns = update.clone()
+    update = zeropower_via_newtonschulz5(update)
+    X = pre_ns.float()
+    v = torch.ones(X.size(-1), dtype=X.dtype, device=X.device)
+    v = v / v.norm().clamp(min=1e-10)
+    for _ in range(5):
+        u_ = X @ v
+        u_ = u_ / u_.norm().clamp(min=1e-10)
+        v = X.mT @ u_
+        v = v / v.norm().clamp(min=1e-10)
+    op_norm = (X @ v).norm().clamp(min=1e-10)
+    normalized_pre = pre_ns / op_norm.to(pre_ns.dtype)
+    opower_F = update.norm()
+    update = update - (_CONTRA_MUON * 0.5) * normalized_pre
+    update = update * (opower_F / update.norm().clamp(min=1e-10))
+    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    return update
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
+        assert isinstance(params, list) and len(params) >= 1
+        if isinstance(params[0], torch.nn.Parameter):
+            params = sorted(params, key=lambda x: x.size(), reverse=True)
+        else:
+            for group in params:
+                group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        for group in self.param_groups:
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum"] = torch.zeros_like(p)
+                    update = muon_update(p.grad, state["momentum"], mu=group["mu"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+                    current_step = group.get("current_step", 0)
+                    lookahead_start = group.get("lookahead_start_step", None)
+                    if lookahead_start is not None and current_step >= lookahead_start:
+                        if "lookahead_slow" not in state:
+                            state["lookahead_slow"] = p.clone()
+                        elif (current_step - lookahead_start) % group["lookahead_interval"] == 0:
+                            slow = state["lookahead_slow"]
+                            slow.add_(p - slow, alpha=group["lookahead_alpha"])
+                            ramp = (current_step - lookahead_start) / group["lookahead_ramp_steps"]
+                            ramp = max(0.0, min(1.0, ramp))
+                            smooth = ramp * ramp * (3.0 - 2.0 * ramp)
+                            p.add_(slow - p, alpha=group["lookahead_pull"] * smooth)
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+
+########################################
+#                Setup                 #
+########################################
+
+########################################
+#              CLI args                #
+########################################
+
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--seed", type=int, default=0)
+_cli_args, _ = _parser.parse_known_args()
+SEED = _cli_args.seed
+
+
+# torchrun sets these env variables
+device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+torch.cuda.set_device(device)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+dist.init_process_group(backend="nccl", device_id=device)
+dist.barrier()
+# this code can be run equivalently with 1, 2, 4, or 8 gpus.
+assert 8 % dist.get_world_size() == 0
+
+# logging setup
+if dist.get_rank() == 0:
+    os.makedirs("logs", exist_ok=True)
+    logfile = f"logs/{uuid.uuid4()}.txt"
+    print(logfile)
+def print0(s, console=False, log=True):
+    if dist.get_rank() == 0:
+        if console:
+            print(s)
+        if log:
+            with open(logfile, "a") as f:
+                print(s, file=f)
+
+print0(f"Using seed={SEED}", console=True)
+
+# we begin by logging this file itself
+print0(code)
+print0("="*100)
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
+       + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
+print0("="*100)
+
+val_tokens = 20 * 524288
+batch_size = 8 * 64 * 1024
+mbs = 64
+val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
+
+model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
+model.compile(dynamic=False)
+
+
+num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
+
+for _ in range(num_trials):
+
+
+    ########################################
+    #       Init & Optim Hyperparams       #
+    ########################################
+
+    # we want to minimize this while still reaching 3.28 val loss
+    train_steps = 3037
+
+    # initialize model parameters
+    for name, p in model.named_parameters():
+        if "proj" in name:
+            p.data.zero_()
+    with torch.no_grad():
+        model.embed.weight.data.mul_(0.7)
+
+    # create the optimizer(s)
+    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
+                        dict(params=[model.proj.weight], lr=1/320),
+                        dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
+                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
+    _ATTN_Q_LR_MULT = 0.61875
+    _ATTN_K_LR_MULT = 0.61875
+    _ATTN_V_LR_MULT = 0.62500
+    _ATTN_PROJ_LR_MULT = 0.63750
+    _MLP_FC_LR_MULT = 1.01250
+    _MLP_PROJ_LR_MULT = 0.98750
+    _ATTN_Q_WEIGHT_DECAY = 0.02775
+    _ATTN_K_WEIGHT_DECAY = 0.02775
+    _ATTN_V_WEIGHT_DECAY = 0.02750
+    _ATTN_PROJ_WEIGHT_DECAY = 0.02700
+    _MLP_FC_WEIGHT_DECAY = 0.03150
+    _MLP_PROJ_WEIGHT_DECAY = 0.03100
+    _attn_q_params = [p for n, p in model.blocks.named_parameters()
+                      if p.ndim >= 2 and ".attn.q." in n]
+    _attn_k_params = [p for n, p in model.blocks.named_parameters()
+                      if p.ndim >= 2 and ".attn.k." in n]
+    _attn_v_params = [p for n, p in model.blocks.named_parameters()
+                      if p.ndim >= 2 and ".attn.v." in n]
+    _attn_proj_params = [p for n, p in model.blocks.named_parameters()
+                         if p.ndim >= 2 and ".attn.proj." in n]
+    _mlp_fc_params = [p for n, p in model.blocks.named_parameters()
+                      if p.ndim >= 2 and ".mlp.fc." in n]
+    _mlp_proj_params = [p for n, p in model.blocks.named_parameters()
+                        if p.ndim >= 2 and ".mlp.proj." in n]
+    _other_body = [p for n, p in model.blocks.named_parameters()
+                   if p.ndim >= 2 and not any(role in n for role in (
+                       ".attn.q.", ".attn.k.", ".attn.v.", ".attn.proj.",
+                       ".mlp.fc.", ".mlp.proj."))]
+    assert all(len(params) == len(model.blocks) for params in (
+        _attn_q_params, _attn_k_params, _attn_v_params, _attn_proj_params,
+        _mlp_fc_params, _mlp_proj_params))
+    assert len(_attn_q_params) + len(_attn_k_params) + len(_attn_v_params) + \
+           len(_attn_proj_params) + len(_mlp_fc_params) + \
+           len(_mlp_proj_params) + len(_other_body) == \
+           len([p for p in model.blocks.parameters() if p.ndim >= 2])
+    assert len(_other_body) == 0
+    optimizer2 = Muon([
+        dict(params=_attn_q_params, lr=0.045 * _ATTN_Q_LR_MULT,
+             weight_decay=_ATTN_Q_WEIGHT_DECAY),
+        dict(params=_attn_k_params, lr=0.045 * _ATTN_K_LR_MULT,
+             weight_decay=_ATTN_K_WEIGHT_DECAY),
+        dict(params=_attn_v_params, lr=0.045 * _ATTN_V_LR_MULT,
+             weight_decay=_ATTN_V_WEIGHT_DECAY),
+        dict(params=_attn_proj_params, lr=0.045 * _ATTN_PROJ_LR_MULT,
+             weight_decay=_ATTN_PROJ_WEIGHT_DECAY),
+        dict(params=_mlp_fc_params, lr=0.045 * _MLP_FC_LR_MULT,
+             weight_decay=_MLP_FC_WEIGHT_DECAY),
+        dict(params=_mlp_proj_params, lr=0.045 * _MLP_PROJ_LR_MULT,
+             weight_decay=_MLP_PROJ_WEIGHT_DECAY),
+    ], lr=0.045, weight_decay=0.030)
+    optimizers = [optimizer1, optimizer2]
+    assert set(p for opt in optimizers for group in opt.param_groups
+               for p in group["params"]) == set(model.parameters())
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["initial_lr"] = group["lr"]
+
+    _MU_MIN = 0.85
+    _MU_MAX = 0.95
+    _MU_WARMUP_STEPS = 300
+    _MU_COOLDOWN_STEPS = 50
+
+    def _muon_mu_at_step(step):
+        cd_start = train_steps - _MU_COOLDOWN_STEPS
+        if step < _MU_WARMUP_STEPS:
+            frac = step / max(_MU_WARMUP_STEPS, 1)
+            return _MU_MIN + frac * (_MU_MAX - _MU_MIN)
+        if step > cd_start:
+            frac = (step - cd_start) / max(_MU_COOLDOWN_STEPS, 1)
+            return _MU_MAX - frac * (_MU_MAX - _MU_MIN)
+        return _MU_MAX
+
+    _ETA_MIN = 0.02
+    _LOOKAHEAD_START_STEP = 2450
+    _LOOKAHEAD_INTERVAL = 25
+    _LOOKAHEAD_ALPHA = 0.35
+    _LOOKAHEAD_PULL = 0.15
+    _LOOKAHEAD_RAMP_STEPS = 150
+
+    # learning rate schedule: stable then decay with a nonzero tail floor
+    def set_hparams(step, cooldown_frac=0.7):
+        progress = step / train_steps
+        assert 0 <= progress < 1
+        if progress < 1 - cooldown_frac:
+            eta_raw = 1.0
+        else:
+            eta_raw = (1 - progress) / cooldown_frac
+        eta = _ETA_MIN + (1.0 - _ETA_MIN) * eta_raw
+        mu = _muon_mu_at_step(step)
+        for group in optimizer2.param_groups:
+            group["mu"] = mu
+            group["current_step"] = step
+            group["lookahead_start_step"] = _LOOKAHEAD_START_STEP
+            group["lookahead_interval"] = _LOOKAHEAD_INTERVAL
+            group["lookahead_alpha"] = _LOOKAHEAD_ALPHA
+            group["lookahead_pull"] = _LOOKAHEAD_PULL
+            group["lookahead_ramp_steps"] = _LOOKAHEAD_RAMP_STEPS
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * eta
+
+
+    ########################################
+    #        Training and Validation       #
+    ########################################
+
+    train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+    for p in model.parameters():
+        dist.broadcast(p.detach(), 0)
+    # start the clock
+    training_time = 0
+    last_val_step = 0
+    dist.barrier()
+    t0 = time.perf_counter()
+    for step in range(train_steps + 1):
+
+        # --------------- VALIDATION SECTION -----------------
+        val_step_freq = 125 if step / train_steps < 0.9 else 25
+        if step == train_steps or step % val_step_freq == 0:
+            # stop the clock
+            dist.barrier()
+            time_since_last_val = time.perf_counter() - t0
+            step_avg = time_since_last_val / (step - last_val_step) if step > 0 else float("nan")
+            last_val_step = step
+            training_time += time_since_last_val
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                assert len(val_inputs) % mbs == 0
+                for i in range(len(val_inputs) // mbs):
+                    val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+            dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+            val_loss /= val_tokens
+            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
+                   + f" step_avg:{1000*step_avg:.2f}ms", console=True)
+            model.train()
+            # start the clock again
+            dist.barrier()
+            t0 = time.perf_counter()
+
+        if step == train_steps:
+            break
+
+        # --------------- TRAINING SECTION -----------------
+        inputs, targets = next(train_loader)
+        # accumulate across microbatches in case we are running with fewer than 8 gpus
+        assert len(inputs) % mbs == 0
+        for i in range(len(inputs) // mbs):
+            model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+        for name, p in model.named_parameters():
+            assert p.grad is not None, name
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        # set optimization hyperparameters and take a step
+        set_hparams(step)
+        for opt in optimizers:
+            opt.step()
+        model.zero_grad(set_to_none=True)
+        approx_training_time = training_time + (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
+               + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
+
+dist.destroy_process_group()
+
+====================================================================================================
+Running PyTorch 2.10.0+cu128 compiled for CUDA 12.8 on NVIDIA H200 with world_size 8
+====================================================================================================
+step:0/3037 val_loss:10.82584 train_time:0.000s step_avg:nanms
+step:125/3037 val_loss:4.57764 train_time:23.999s step_avg:191.99ms
+step:250/3037 val_loss:4.09639 train_time:42.360s step_avg:146.89ms
+step:375/3037 val_loss:3.92057 train_time:60.564s step_avg:145.63ms
+step:500/3037 val_loss:3.81132 train_time:78.836s step_avg:146.18ms
+step:625/3037 val_loss:3.74570 train_time:97.126s step_avg:146.32ms
+step:750/3037 val_loss:3.69807 train_time:115.350s step_avg:145.79ms
+step:875/3037 val_loss:3.66101 train_time:133.635s step_avg:146.28ms
+step:1000/3037 val_loss:3.62192 train_time:151.918s step_avg:146.27ms
+step:1125/3037 val_loss:3.59487 train_time:170.115s step_avg:145.57ms
+step:1250/3037 val_loss:3.56145 train_time:188.380s step_avg:146.12ms
+step:1375/3037 val_loss:3.53530 train_time:206.646s step_avg:146.13ms
+step:1500/3037 val_loss:3.50930 train_time:224.848s step_avg:145.62ms
+step:1625/3037 val_loss:3.49007 train_time:243.096s step_avg:145.99ms
+step:1750/3037 val_loss:3.46569 train_time:261.347s step_avg:146.01ms
+step:1875/3037 val_loss:3.44470 train_time:279.523s step_avg:145.41ms
+step:2000/3037 val_loss:3.42438 train_time:297.773s step_avg:146.00ms
+step:2125/3037 val_loss:3.40582 train_time:316.009s step_avg:145.89ms
+step:2250/3037 val_loss:3.38663 train_time:334.181s step_avg:145.38ms
+step:2375/3037 val_loss:3.36870 train_time:352.411s step_avg:145.83ms
+step:2500/3037 val_loss:3.34953 train_time:370.681s step_avg:146.16ms
+step:2625/3037 val_loss:3.32757 train_time:388.875s step_avg:145.55ms
+step:2750/3037 val_loss:3.30944 train_time:407.117s step_avg:145.94ms
+step:2775/3037 val_loss:3.30555 train_time:410.757s step_avg:145.60ms
+step:2800/3037 val_loss:3.30199 train_time:414.393s step_avg:145.43ms
+step:2825/3037 val_loss:3.29926 train_time:418.041s step_avg:145.91ms
+step:2850/3037 val_loss:3.29642 train_time:421.686s step_avg:145.79ms
+step:2875/3037 val_loss:3.29344 train_time:425.385s step_avg:147.99ms
+step:2900/3037 val_loss:3.29035 train_time:429.024s step_avg:145.54ms
+step:2925/3037 val_loss:3.28742 train_time:432.658s step_avg:145.36ms
+step:2950/3037 val_loss:3.28497 train_time:436.299s step_avg:145.62ms
+step:2975/3037 val_loss:3.28254 train_time:439.936s step_avg:145.49ms
+step:3000/3037 val_loss:3.28015 train_time:443.573s step_avg:145.51ms
+step:3025/3037 val_loss:3.27784 train_time:447.211s step_avg:145.48ms
+step:3037/3037 val_loss:3.27708 train_time:448.956s step_avg:145.46ms
