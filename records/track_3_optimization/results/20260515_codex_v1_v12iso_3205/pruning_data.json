@@ -1,0 +1,120 @@
+{
+  "baseline": {
+    "delta": 0.0,
+    "is_baseline": true,
+    "label": "v12iso-baseline",
+    "mean": 3.27907,
+    "n": 8,
+    "score": 0.0026304372260136043,
+    "std": null
+  },
+  "source_note": "pruning-rerun aggregate for codex_v1_v12iso at the original 3195-step screen",
+  "target_step": 3195,
+  "variants": [
+    {
+      "delta": 0.0,
+      "is_baseline": true,
+      "label": "v12iso-baseline",
+      "mean": 3.27907,
+      "n": 8,
+      "score": 0.0026304372260136043,
+      "std": null
+    },
+    {
+      "delta": -7.00000000000145e-05,
+      "label": "noResPulse",
+      "mean": 3.279,
+      "n": 8,
+      "score": 0.0028284271247458787,
+      "std": 0.00086
+    },
+    {
+      "delta": -3.999999999981796e-05,
+      "label": "noMomRefresh",
+      "mean": 3.27903,
+      "n": 8,
+      "score": 0.0027435743110029373,
+      "std": 0.00074
+    },
+    {
+      "delta": -1.0000000000065512e-05,
+      "label": "noBeta2Thaw",
+      "mean": 3.27906,
+      "n": 8,
+      "score": 0.002658721497261252,
+      "std": 0.00071
+    },
+    {
+      "delta": 2.0000000000131024e-05,
+      "label": "noLateLR",
+      "mean": 3.27909,
+      "n": 8,
+      "score": 0.00257386868351831,
+      "std": 0.00072
+    },
+    {
+      "delta": 0.00011000000000027654,
+      "label": "noResRMSNorm",
+      "mean": 3.27918,
+      "n": 8,
+      "score": 0.0023193102422907415,
+      "std": 0.00083
+    },
+    {
+      "delta": 0.000140000000000029,
+      "label": "noTailFeedback",
+      "mean": 3.27921,
+      "n": 8,
+      "score": 0.0022344574285490556,
+      "std": 0.00059
+    },
+    {
+      "delta": 0.00017000000000022553,
+      "label": "noTailRD",
+      "mean": 3.27924,
+      "n": 8,
+      "score": 0.0021496046148061143,
+      "std": 0.00086
+    },
+    {
+      "delta": 0.00024000000000024002,
+      "label": "noAggMo3",
+      "mean": 3.27931,
+      "n": 8,
+      "score": 0.00195161471607384,
+      "std": 0.00056
+    },
+    {
+      "delta": 0.0007600000000000939,
+      "label": "noErrorFeedback",
+      "mean": 3.27983,
+      "n": 8,
+      "score": 0.00048083261120623416,
+      "std": 0.00075
+    },
+    {
+      "delta": 0.0009100000000001884,
+      "label": "noMuSched",
+      "mean": 3.27998,
+      "n": 8,
+      "score": 5.656854249403832e-05,
+      "std": 0.00067
+    },
+    {
+      "delta": 0.0022899999999999032,
+      "label": "noMuon2f",
+      "mean": 3.28136,
+      "n": 8,
+      "score": -0.0038466608896548975,
+      "std": 0.00085
+    },
+    {
+      "delta": 0.0025100000000000122,
+      "label": "noTailEMA",
+      "mean": 3.28158,
+      "n": 8,
+      "score": -0.004468914857099368,
+      "std": 0.00074
+    }
+  ]
+}
