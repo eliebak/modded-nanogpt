@@ -1,0 +1,104 @@
+{
+  "baseline": {
+    "delta": 0.0,
+    "is_baseline": true,
+    "label": "legal3037-baseline",
+    "mean": 3.27885,
+    "n": 8,
+    "score": 0.0032526911934580745,
+    "std": null
+  },
+  "source_note": "pruning-rerun aggregate for codex_v2_legal_3037 at 3037 steps",
+  "target_step": 3037,
+  "variants": [
+    {
+      "delta": 0.0,
+      "is_baseline": true,
+      "label": "legal3037-baseline",
+      "mean": 3.27885,
+      "n": 8,
+      "score": 0.0032526911934580745,
+      "std": null
+    },
+    {
+      "delta": 8.000000000008001e-05,
+      "label": "noContraMuon",
+      "mean": 3.27893,
+      "n": 8,
+      "score": 0.003026417023478153,
+      "std": 0.00114
+    },
+    {
+      "delta": 0.00041000000000002146,
+      "label": "noRoleWD",
+      "mean": 3.27926,
+      "n": 8,
+      "score": 0.002093036072312076,
+      "std": 0.0007
+    },
+    {
+      "delta": 0.000920000000000254,
+      "label": "noEmbedInit",
+      "mean": 3.27977,
+      "n": 8,
+      "score": 0.0006505382386908613,
+      "std": 0.00124
+    },
+    {
+      "delta": 0.0009700000000001374,
+      "label": "noEtaMin",
+      "mean": 3.27982,
+      "n": 8,
+      "score": 0.0005091168824538813,
+      "std": 0.00095
+    },
+    {
+      "delta": 0.0011700000000001154,
+      "label": "noPolarExpress",
+      "mean": 3.28002,
+      "n": 8,
+      "score": -5.65685424952944e-05,
+      "std": 0.00061
+    },
+    {
+      "delta": 0.0011700000000001154,
+      "label": "noLookahead",
+      "mean": 3.28002,
+      "n": 8,
+      "score": -5.65685424952944e-05,
+      "std": 0.00091
+    },
+    {
+      "delta": 0.0029200000000000337,
+      "label": "noRoleLR",
+      "mean": 3.28177,
+      "n": 8,
+      "score": -0.005006316010800896,
+      "std": 0.00096
+    },
+    {
+      "delta": 0.003530000000000033,
+      "label": "noMuonEq",
+      "mean": 3.28238,
+      "n": 8,
+      "score": -0.006731656556896071,
+      "std": 0.00096
+    },
+    {
+      "delta": 0.0038800000000001056,
+      "label": "cf1.0",
+      "mean": 3.28273,
+      "n": 3,
+      "score": -0.004728498704663245,
+      "std": 0.00127
+    },
+    {
+      "delta": 0.004590000000000316,
+      "label": "noMuSched",
+      "mean": 3.28344,
+      "n": 3,
+      "score": -0.005958254778037512,
+      "std": 0.00054
+    }
+  ]
+}
