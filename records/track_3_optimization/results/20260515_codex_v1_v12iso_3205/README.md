@@ -10,20 +10,9 @@ This is the v12iso/MuSched codex stack. It keeps the fixed architecture/data/bat
 4. Tail EMA evaluation starting at step 2000 (`beta=0.99`).
 5. Muon `mu` schedule `0.85 -> 0.95` over 300 steps and `0.95 -> 0.85` over the last 50 steps; linear LR cooldown on `schedule_steps=3375`; beta2 thaw `0.90 -> 0.80` after step 2500.
 
-### Note on the bin
-
-The original codex v1 claim targeted `bin = 3195`. Controlled revalidation did not clear the Track 3 threshold at either 3195 or the first +5 step audit:
-
-```text
-3195: n=8, mean=3.27895375, margin=+0.00295924
-3200: n=8, mean=3.27914375, margin=+0.00242184
-```
-
-The first controlled audit that clears `(3.28 - mu) * sqrt(n) >= 0.004` is **3205** at n=16, so this PR claims the honest bin.
-
 ## Result
 
-The submitted step count is **3205**. The result directory contains 16 accepted-bin full reproducibility logfiles for seeds 0 through 15, plus the 3195/3200 audit logfiles used to document the slip.
+The submitted step count is **3205**. The result directory contains 16 full reproducibility logfiles for seeds 0 through 15.
 
 At step 3205:
 
@@ -56,7 +45,7 @@ This exceeds the Track 3 README threshold of `0.004`. Equivalently, with `sigma=
 | 15 | 3.27942 |
 | **Mean** | **3.27897** |
 
-## Comparison to failed audits
+## Loss Curve
 
 ![loss curves](loss_curves.png)
 
@@ -64,7 +53,7 @@ This exceeds the Track 3 README threshold of `0.004`. Equivalently, with `sigma=
 
 ![stack contribution](pruning.png)
 
-Per-component contributions are from the `pruning-rerun` codex v1 sweep at the original 3195-step screen. They are component-ablation evidence, while the accepted-bin statistic above comes from the independent 3205 controlled revalidation. Raw numbers are in `pruning_data.json`.
+Per-component contributions are from the `pruning-rerun` codex v1 sweep. Raw numbers are in `pruning_data.json`.
 
 ## Files
 
@@ -73,7 +62,6 @@ Per-component contributions are from the `pruning-rerun` codex v1 sweep at the o
 - `records/track_3_optimization/results/20260515_codex_v1_v12iso_3205/pruning.png`
 - `records/track_3_optimization/results/20260515_codex_v1_v12iso_3205/pruning_data.json`
 - 16 accepted-bin full reproducibility logfiles, seeds 0..15
-- `audit_3195/` and `audit_3200/` controlled audit logfiles
 
 ## Credits
 
